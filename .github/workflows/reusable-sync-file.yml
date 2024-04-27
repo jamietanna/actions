@@ -1,0 +1,137 @@
+name: "Determine if a vendored file is out-of-sync and if so, raise a PR to update it"
+permissions:
+  contents: write
+  # note that this also requires that GitHub Actions can raise PRs via steps in https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#preventing-github-actions-from-creating-or-approving-pull-requests
+  pull-requests: write
+on:
+  workflow_call:
+    inputs:
+      identifier:
+        type: string
+        description: This will be used as the branch name
+        required: true
+      remote_slug:
+        type: string
+        description: The org/repo slug i.e. `deepmap/oapi-codegen`
+        required: true
+      remote_ref:
+        type: string
+        description: The committish reference i.e. `HEAD`, `main`, `v1.2.3` or a commit hash
+        default: HEAD
+      remote_path:
+        type: string
+        description: The location within the remote repository that the file is
+        required: true
+      local_path:
+        type: string
+        description: The location within the local repository that the file is
+        required: true
+    secrets:
+      cross_repo_github_token:
+        required: true
+        description: A read-only GITHUB_TOKEN that should be used to retrieve the remote location's specification. Can be the source job's GITHUB_TOKEN if the remote repo is public.
+
+jobs:
+  sync-file:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: "Fetch the latest version of ${{ inputs.remote_slug }}'s copy of `${{ inputs.remote_path }}` (from ${{ inputs.remote_ref }})"
+        id: fetch-remote
+        run: |
+          set -o pipefail
+          gh api "/repos/${{ inputs.remote_slug }}/contents/${{ inputs.remote_path }}?ref=${{ inputs.remote_ref }}" --template '{{ .content }}' | base64 -d > "/tmp/${{ inputs.identifier}}-remote-copy-${{ inputs.remote_ref }}"
+          echo "filename=/tmp/${{ inputs.identifier}}-remote-copy-${{ inputs.remote_ref }}" >> "$GITHUB_OUTPUT"
+          echo "branch=actions-sync-file/${{ inputs.identifier }}" >> "$GITHUB_OUTPUT"
+
+        env:
+          GH_TOKEN: ${{ secrets.cross_repo_github_token }}
+
+      - name: "Is the latest version of ${{ inputs.remote_slug }}'s copy of `${{ inputs.remote_path }}` (from ${{ inputs.remote_ref }}) out of sync with our copy in `${{ inputs.local_path }}`?"
+        id: needs-sync
+        run: |
+          git diff --color --no-index ${{ steps.fetch-remote.outputs.filename }} ${{ inputs.local_path }} || \
+            echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+
+      - name: "Does a PR (branch) already exist?"
+        id: check-pr-exists
+        if: ${{ steps.needs-sync.outputs.needs_sync == 'true' }}
+        run: |
+          # via https://stackoverflow.com/a/73828715/2257038
+          prs=$(gh pr list \
+              --head ${{ steps.fetch-remote.outputs.branch }} \
+              --json number \
+              --jq 'length')
+          if ((prs > 0)); then
+              echo "has_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit changes
+        if: ${{ steps.needs-sync.outputs.needs_sync == 'true' }}
+        run: |
+          git config user.email "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          git config user.name "github-actions[bot]"
+
+          # make sure that we've checked this out freshly from the default branch
+          git fetch origin
+          git remote set-head -a origin
+
+          git checkout -b ${{ steps.fetch-remote.outputs.branch }} origin/HEAD
+          cp ${{ steps.fetch-remote.outputs.filename }} ${{ inputs.local_path }}
+          git add ${{ inputs.local_path }}
+          git commit -F- <<EOF
+            Update ${{ inputs.local_path }} with latest upstream changes
+
+            remote_slug: ${{ inputs.remote_slug }}
+            remote_path: ${{ inputs.remote_path }}
+            remote_ref:  ${{ inputs.remote_ref }}
+          EOF
+          #
+          # in case there is an existing PR
+          git push -f origin ${{ steps.fetch-remote.outputs.branch }}
+
+      - name: "Raise PR"
+        if: ${{ steps.needs-sync.outputs.needs_sync == 'true' && steps.check-pr-exists.outputs.has_pr != 'true' }}
+        run: |
+          gh pr create --title "Update ${{ inputs.identifier }} file" --body-file - <<EOF
+            This is an automagic update to the ${{ inputs.local_path }} file from GitHub Actions, based on changes upstream with the following config:
+
+            - remote_slug: <code>${{ inputs.remote_slug }}</code>
+            - remote_path: <code>${{ inputs.remote_path }}</code>
+            - remote_ref:  <code>${{ inputs.remote_ref }}</code>
+
+            This points to [this location](https://github.com/${{ inputs.remote_slug }}/tree/${{ inputs.remote_ref }}/${{ inputs.remote_path }})
+          EOF
+
+          pr=$(gh pr list --head actions-sync-file/${{ inputs.identifier }} --json url --jq '.[].url')
+
+          # then add to the job summary
+          echo '## `${{ inputs.identifier }}`' >> "$GITHUB_STEP_SUMMARY"
+          echo "Changes have been raised in PR: $pr" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Update PR"
+        if: ${{ steps.needs-sync.outputs.needs_sync == 'true' && steps.check-pr-exists.outputs.has_pr == 'true' }}
+        run: |
+          gh pr edit actions-sync-file/${{ inputs.identifier }} --title "Update ${{ inputs.identifier }} file" --body-file - <<EOF
+            This is an automagic update to the ${{ inputs.local_path }} file from GitHub Actions, based on changes upstream with the following config:
+
+            - remote_slug: <code>${{ inputs.remote_slug }}</code>
+            - remote_path: <code>${{ inputs.remote_path }}</code>
+            - remote_ref:  <code>${{ inputs.remote_ref }}</code>
+
+            This points to [this location](https://github.com/${{ inputs.remote_slug }}/tree/${{ inputs.remote_ref }}/${{ inputs.remote_path }})
+          EOF
+
+          pr=$(gh pr list --head actions-sync-file/${{ inputs.identifier }} --json url --jq '.[].url')
+
+          # then add to the job summary
+          echo '## `${{ inputs.identifier }}`' >> "$GITHUB_STEP_SUMMARY"
+          echo "Changes have been raised in PR: $pr" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
